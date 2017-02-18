@@ -3,6 +3,7 @@ import base64
 from datetime import datetime
 import os
 import shutil
+import json
 
 import numpy as np
 import socketio
@@ -14,12 +15,52 @@ from io import BytesIO
 
 from keras.models import load_model
 import h5py
-from keras import __version__ as keras_version
+from keras.models import model_from_json
+
+import utils
 
 sio = socketio.Server()
 app = Flask(__name__)
 model = None
 prev_image_array = None
+
+class LowPassFilter:
+    def __init__(self, order):
+        self.control_cycle = 0
+        self.order = order
+        self.steerings_history = np.zeros(self.order)
+    def smooth(self,steering):
+        self.steerings_history[self.control_cycle%self.order] = steering
+        self.control_cycle += 1
+        adjusted = 0.3*np.mean(self.steerings_history) + 0.7*steering
+        return adjusted
+
+
+class SimplePIController:
+    def __init__(self, Kp, Ki):
+        self.Kp = Kp
+        self.Ki = Ki
+        self.set_point = 0.
+        self.error = 0.
+        self.integral = 0.
+
+    def set_desired(self, desired):
+        self.set_point = desired
+
+    def update(self, measurement):
+        # proportional error
+        self.error = self.set_point - measurement
+
+        # integral error
+        self.integral += self.error
+
+        return self.Kp * self.error + self.Ki * self.integral
+
+
+controller = SimplePIController(0.2, 0.002)
+set_speed = 15
+controller.set_desired(set_speed)
+filter = LowPassFilter(4)
 
 
 @sio.on('telemetry')
@@ -35,16 +76,11 @@ def telemetry(sid, data):
         imgString = data["image"]
         image = Image.open(BytesIO(base64.b64decode(imgString)))
         image_array = np.asarray(image)
+        image_array = utils.crop_and_reshape(image_array)
         steering_angle = float(model.predict(image_array[None, :, :, :], batch_size=1))
-        min_speed = 8
-        max_speed = 10
-        if float(speed) < min_speed:
-            throttle = 1.0
-        elif float(speed) > max_speed:
-            throttle = -1.0
-        else:
-            throttle = 0.1
-        
+        steering_angle = filter.smooth(steering_angle)
+        throttle = controller.update(float(speed))
+
         print(steering_angle, throttle)
         send_control(steering_angle, throttle)
 
@@ -90,16 +126,12 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
 
-    # check that model Keras version is same as local Keras version
-    f = h5py.File(args.model, mode='r')
-    model_version = f.attrs.get('keras_version')
-    keras_version = str(keras_version).encode('utf8')
+    with open(args.model, 'r') as jsonFile:
+        model = model_from_json(json.load(jsonFile))
 
-    if model_version != keras_version:
-        print('You are using Keras version ', keras_version,
-            ', but the model was built using ', model_version)
-        
-    model = load_model(args.model)
+    model.compile("adam", "mse")
+    h5File = args.model.replace('json', 'h5')
+    model.load_weights(h5File)
 
     if args.image_folder != '':
         print("Creating image folder at {}".format(args.image_folder))
